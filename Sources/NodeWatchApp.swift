@@ -9,11 +9,10 @@ struct NodeWatchApp: App {
             MenuView(store: store)
         } label: {
             // Menu bar labels render as template images; a count next to the icon
-            // is the cue that something is running.
-            if store.servers.isEmpty {
-                Image(systemName: "hexagon")
-            } else {
-                Image(systemName: store.exposedCount > 0 ? "exclamationmark.triangle" : "hexagon.fill")
+            // is the cue that something is running. The network-exposure warning
+            // lives on each row in the menu, so the menu bar stays calm.
+            Image(systemName: "server.rack")
+            if !store.servers.isEmpty {
                 Text("\(store.servers.count)")
             }
         }

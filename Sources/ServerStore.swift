@@ -40,8 +40,6 @@ final class ServerStore {
         }
     }
 
-    var exposedCount: Int { servers.filter(\.exposed).count }
-
     func refresh() {
         guard !scanning else { return }
         scanning = true

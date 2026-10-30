@@ -15,7 +15,7 @@ For every node, bun or deno process listening on a TCP port (Python optional):
 
 Actions: **Open** (localhost in your browser), **Show Folder**, **Stop** (click twice to confirm; sends SIGTERM, then offers **Force Stop** if the server is still running 2 seconds later).
 
-The menu bar shows a count of running servers. The icon becomes a warning triangle when any of them is reachable from the network.
+The menu bar shows a server icon with a count of running servers. Network exposure is flagged on each row inside the menu, not in the menu bar.
 
 ## Build
 
