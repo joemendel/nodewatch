@@ -30,7 +30,9 @@ extension Scanner {
     /// This relies on Local's internal layout, which isn't a public interface.
     /// If it changes, this returns nil and the Local section simply disappears.
     static func scanLocal(listeners: [Int32: Listener]) -> LocalStatus? {
-        guard let out = run("/bin/ps", ["-axo", "pid=,etime=,args="]) else { return nil }
+        // Only your own processes: another account's process could otherwise put
+        // a crafted "/Local/run/<id>/" in its arguments to inject a row.
+        guard let out = run("/bin/ps", ["-U", String(getuid()), "-o", "pid=,etime=,args="]) else { return nil }
 
         var siteElapsed: [String: [String]] = [:]
         var sitePids: [String: [Int32]] = [:]
@@ -68,18 +70,19 @@ extension Scanner {
             status.mailpitURL = "http://localhost:\(web)"
         }
 
-        status.sites = siteElapsed.keys.sorted().map { id in
-            let site = info[id]
+        // Only IDs that Local itself knows about. A process's arguments are not a
+        // trustworthy source for a URL, so an ID missing from sites.json is dropped.
+        status.sites = siteElapsed.keys.sorted().compactMap { id -> LocalSite? in
+            guard let site = info[id], let domain = site.domain, let name = site.name else { return nil }
             let ownPort = merged(sitePids[id] ?? [], listeners).ports.sorted().first
-            let domain = site?.domain ?? id
             let url: String
-            if usesRouter, site?.domain != nil { url = "http://\(domain)" }
+            if usesRouter { url = "http://\(domain)" }
             else if let ownPort { url = "http://localhost:\(ownPort)" }
             else { url = "http://\(domain)" }
             // The site's processes start together; the longest-running one is its uptime.
             let longest = (siteElapsed[id] ?? []).max { elapsedSeconds($0) < elapsedSeconds($1) } ?? ""
-            return LocalSite(id: id, name: site?.name ?? "Unknown site", domain: domain,
-                             folder: site?.folder, php: site?.php,
+            return LocalSite(id: id, name: name, domain: domain,
+                             folder: site.folder, php: site.php,
                              uptime: formatElapsed(longest), url: url)
         }
         .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
