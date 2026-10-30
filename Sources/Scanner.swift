@@ -343,7 +343,7 @@ enum Scanner {
 
     // MARK: - Helpers
 
-    /// "/opt/homebrew/bin/node /Users/joe/x/node_modules/.bin/vite --port 5173" -> "vite --port 5173"
+    /// "/opt/homebrew/bin/node /Users/you/app/node_modules/.bin/vite --port 5173" -> "vite --port 5173"
     private static func summarize(_ args: String) -> String {
         var parts = args.split(separator: " ").map(String.init)
         if let first = parts.first, ["node", "nodejs", "bun", "deno"].contains((first as NSString).lastPathComponent) || first.lowercased().contains("python") {
