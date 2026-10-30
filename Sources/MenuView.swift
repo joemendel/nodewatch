@@ -50,10 +50,12 @@ struct MenuView: View {
         VStack(alignment: .leading, spacing: 6) {
             Toggle("Include Python servers", isOn: $store.includePython)
             Toggle("Notify when a new server starts", isOn: $store.notifyOnNew)
+            if store.notifyOnNew { notificationStatus }
             Toggle("Launch at login", isOn: Binding(
                 get: { store.launchAtLogin },
                 set: { store.launchAtLogin = $0 }
             ))
+            loginItemStatus
             HStack {
                 Spacer()
                 Button("Quit NodeWatch") { NSApplication.shared.terminate(nil) }
@@ -63,6 +65,60 @@ struct MenuView: View {
         .toggleStyle(.checkbox)
         .font(.callout)
         .padding(12)
+        .onAppear { store.refreshPermissions() }
+    }
+
+    // Inline results, shown under the matching checkbox. macOS reports these
+    // changes with banners that land underneath this menu, out of sight.
+
+    @ViewBuilder
+    private var notificationStatus: some View {
+        switch store.notificationStatus {
+        case .denied:
+            StatusLine(text: "Blocked in System Settings", color: .orange,
+                       action: ("Open Settings", store.openNotificationSettings))
+        case .notDetermined:
+            StatusLine(text: "Waiting for you to allow notifications", color: .secondary)
+        default:
+            StatusLine(text: "Allowed", color: .green)
+        }
+    }
+
+    @ViewBuilder
+    private var loginItemStatus: some View {
+        if let error = store.loginItemError {
+            StatusLine(text: "Couldn't change: \(error)", color: .orange)
+        } else {
+            switch store.loginItemStatus {
+            case .enabled:
+                StatusLine(text: "On: NodeWatch starts when you log in", color: .green)
+            case .requiresApproval:
+                StatusLine(text: "Needs your approval in System Settings", color: .orange,
+                           action: ("Open Login Items", store.openLoginItemsSettings))
+            default:
+                EmptyView()
+            }
+        }
+    }
+}
+
+/// A small caption under a checkbox, indented to line up with its label.
+struct StatusLine: View {
+    let text: String
+    let color: Color
+    var action: (title: String, run: () -> Void)?
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Circle().fill(color).frame(width: 6, height: 6)
+            Text(text).foregroundStyle(.secondary)
+            if let action {
+                Button(action.title, action: action.run)
+                    .buttonStyle(.link)
+            }
+        }
+        .font(.caption)
+        .padding(.leading, 20)
     }
 }
 

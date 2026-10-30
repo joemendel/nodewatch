@@ -97,22 +97,52 @@ final class ServerStore {
 
     // MARK: - Launch at login
 
+    /// macOS confirms login-item changes with its own banner, which slides in
+    /// under this menu. The menu shows the result inline so the banner isn't needed.
+    private(set) var loginItemStatus: SMAppService.Status = SMAppService.mainApp.status
+    private(set) var loginItemError: String?
+
     var launchAtLogin: Bool {
-        get { SMAppService.mainApp.status == .enabled }
+        get { loginItemStatus == .enabled || loginItemStatus == .requiresApproval }
         set {
+            loginItemError = nil
             do {
                 if newValue { try SMAppService.mainApp.register() }
                 else { try SMAppService.mainApp.unregister() }
             } catch {
-                NSLog("NodeWatch: launch at login change failed: \(error)")
+                loginItemError = error.localizedDescription
             }
+            loginItemStatus = SMAppService.mainApp.status
         }
+    }
+
+    func openLoginItemsSettings() {
+        SMAppService.openSystemSettingsLoginItems()
     }
 
     // MARK: - Notifications
 
+    private(set) var notificationStatus: UNAuthorizationStatus = .notDetermined
+
+    /// Called when the menu opens: either setting can change in System Settings
+    /// while NodeWatch is running.
+    func refreshPermissions() {
+        loginItemStatus = SMAppService.mainApp.status
+        UNUserNotificationCenter.current().getNotificationSettings { settings in
+            let status = settings.authorizationStatus
+            Task { @MainActor in self.notificationStatus = status }
+        }
+    }
+
+    func openNotificationSettings() {
+        guard let url = URL(string: "x-apple.systempreferences:com.apple.Notifications-Settings.extension?id=com.joemendel.nodewatch") else { return }
+        NSWorkspace.shared.open(url)
+    }
+
     private func requestNotificationPermission() {
-        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in
+            Task { @MainActor in self.refreshPermissions() }
+        }
     }
 
     private func notify(_ server: DevServer) {
