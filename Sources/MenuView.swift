@@ -184,7 +184,7 @@ struct ServerRow: View {
 
     @ViewBuilder
     private var stopButton: some View {
-        if store.stubborn.contains(server.pid) {
+        if store.stubborn.contains(server.key) {
             Button("Force Stop", role: .destructive) { store.forceStop(server) }
                 .tint(.red)
                 .help("It ignored the polite request. This kills it immediately.")

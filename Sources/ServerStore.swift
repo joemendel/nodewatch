@@ -9,11 +9,16 @@ import UserNotifications
 final class ServerStore {
     private(set) var servers: [DevServer] = []
     private(set) var lastScan: Date?
-    /// PIDs that were asked to stop but are still running: offer a force stop.
-    private(set) var stubborn: Set<Int32> = []
+    /// Processes that were asked to stop but are still running: offer a force stop.
+    private(set) var stubborn: Set<ProcessKey> = []
 
     var includePython: Bool {
-        didSet { UserDefaults.standard.set(includePython, forKey: "includePython"); refresh() }
+        didSet {
+            UserDefaults.standard.set(includePython, forKey: "includePython")
+            // Servers that appear only because of this toggle aren't "new".
+            suppressNextNotifications = true
+            refresh()
+        }
     }
     var notifyOnNew: Bool {
         didSet {
@@ -22,9 +27,13 @@ final class ServerStore {
         }
     }
 
-    private var known: Set<Int32> = []
-    private var firstScanDone = false
+    /// Servers already seen, as port + folder rather than PID: watch-mode tools
+    /// (node --watch, nodemon, tsx watch) restart under a new PID on every save,
+    /// and that shouldn't count as a new server.
+    private var knownEndpoints: Set<String> = []
+    private var suppressNextNotifications = true
     private var scanning = false
+    private var rescanPending = false
     private var timer: Timer?
 
     init() {
@@ -34,39 +43,57 @@ final class ServerStore {
         notifyOnNew = defaults.bool(forKey: "notifyOnNew")
         if notifyOnNew { requestNotificationPermission() }
         refresh()
-        // Background polling keeps the menu bar count honest. A scan is ~50 ms.
-        timer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+        // Background polling keeps the menu bar count honest. A scan is ~250 ms of
+        // mostly waiting; the tolerance lets macOS batch these wake-ups with others.
+        let timer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.refresh() }
         }
+        timer.tolerance = 1
+        self.timer = timer
     }
 
     func refresh() {
-        guard !scanning else { return }
+        // A refresh requested mid-scan (say, a toggle change) runs right after it,
+        // so the result never reflects stale settings.
+        guard !scanning else { rescanPending = true; return }
         scanning = true
         let python = includePython
+        var knownLaunchers: [ProcessKey: Launcher] = [:]
+        for server in servers { knownLaunchers[server.key] = server.launcher }
         Task.detached(priority: .utility) {
-            let found = Scanner.scan(includePython: python)
+            let found = await Scanner.scan(includePython: python, knownLaunchers: knownLaunchers)
             await MainActor.run { self.apply(found) }
         }
     }
 
-    private func apply(_ found: [DevServer]) {
+    private func apply(_ found: [DevServer]?) {
         scanning = false
-        let pids = Set(found.map(\.pid))
-        if firstScanDone, notifyOnNew {
-            for server in found where !known.contains(server.pid) { notify(server) }
+        defer {
+            if rescanPending { rescanPending = false; refresh() }
         }
-        known = pids
-        firstScanDone = true
-        stubborn = stubborn.intersection(pids)
+        // nil means the scan itself failed. Keep the last good list rather than
+        // reporting "nothing running" and re-notifying everything next time.
+        guard let found else { return }
+
+        let endpoints = Set(found.map(endpoint))
+        if !suppressNextNotifications, notifyOnNew {
+            for server in found where !knownEndpoints.contains(endpoint(server)) { notify(server) }
+        }
+        knownEndpoints = endpoints
+        suppressNextNotifications = false
+        stubborn = stubborn.intersection(Set(found.map(\.key)))
         servers = found
         lastScan = Date()
+    }
+
+    private func endpoint(_ server: DevServer) -> String {
+        "\(server.primaryPort)|\(server.folder ?? server.commandLine)"
     }
 
     // MARK: - Actions
 
     func open(_ server: DevServer, port: Int? = nil) {
-        guard let url = URL(string: "http://localhost:\(port ?? server.primaryPort)") else { return }
+        guard let url = URL(string: "http://\(server.openHost):\(port ?? server.primaryPort)") else { return }
         NSWorkspace.shared.open(url)
     }
 
@@ -77,18 +104,24 @@ final class ServerStore {
 
     /// SIGTERM lets the server shut down cleanly. If it is still alive 2 s later,
     /// the row offers a force stop (SIGKILL).
+    ///
+    /// The row's PID can be up to 5 s old. If that server exited on its own and
+    /// macOS gave the PID to another process, signalling it would hit the wrong
+    /// thing, so every signal first checks the start time still matches.
     func stop(_ server: DevServer) {
+        guard server.key.isAlive else { refresh(); return }
         kill(server.pid, SIGTERM)
         Task {
             try? await Task.sleep(for: .seconds(2))
-            if kill(server.pid, 0) == 0 { stubborn.insert(server.pid) }
+            if server.key.isAlive { stubborn.insert(server.key) }
             refresh()
         }
     }
 
     func forceStop(_ server: DevServer) {
+        stubborn.remove(server.key)
+        guard server.key.isAlive else { refresh(); return }
         kill(server.pid, SIGKILL)
-        stubborn.remove(server.pid)
         Task {
             try? await Task.sleep(for: .milliseconds(500))
             refresh()

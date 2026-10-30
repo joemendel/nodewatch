@@ -1,17 +1,38 @@
+import Darwin
 import Foundation
+
+/// A process identity that survives PID reuse: macOS can hand a PID to a new
+/// process once the old one exits, but the pair (pid, start time) is unique.
+struct ProcessKey: Hashable, Sendable {
+    let pid: Int32
+    let start: UInt64            // microseconds since 1970
+
+    /// Reads the start time from the kernel. nil when the process is gone.
+    static func current(_ pid: Int32) -> ProcessKey? {
+        var info = proc_bsdinfo()
+        let size = Int32(MemoryLayout<proc_bsdinfo>.size)
+        guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size) == size else { return nil }
+        return ProcessKey(pid: pid, start: UInt64(info.pbi_start_tvsec) * 1_000_000 + UInt64(info.pbi_start_tvusec))
+    }
+
+    /// True only if this exact process is still running.
+    var isAlive: Bool { ProcessKey.current(pid) == self }
+}
 
 /// One dev server process that is listening on at least one TCP port.
 struct DevServer: Identifiable, Sendable, Equatable {
-    let pid: Int32
+    let key: ProcessKey
     let runtime: String          // node, bun, deno, python
     let ports: [Int]
-    let exposed: Bool            // listening on all interfaces, reachable from the network
+    let exposed: Bool            // bound to something other than loopback: reachable from the network
+    let openHost: String         // where Open should point; localhost unless bound to one specific address
     let folder: String?          // working directory, nil when it is "/"
     let commandLine: String      // what was run, trimmed for display
     let uptime: String
     let launcher: Launcher
 
-    var id: Int32 { pid }
+    var pid: Int32 { key.pid }
+    var id: ProcessKey { key }
     var primaryPort: Int { ports.first ?? 0 }
 
     var projectName: String {
@@ -45,44 +66,57 @@ enum Launcher: Sendable, Equatable {
 }
 
 enum Scanner {
-    /// One lsof pass to find listeners, then four lookups run in parallel.
-    /// Run one after another they cost ~450 ms, mostly process startup.
-    static func scan(includePython: Bool) -> [DevServer] {
-        let listeners = listeningProcesses(includePython: includePython)
+    /// One lsof pass to find listeners, then four lookups run in parallel
+    /// (about 250 ms in all, mostly process startup).
+    ///
+    /// `knownLaunchers` carries launcher results from earlier scans, so a
+    /// detached server's environment is read once, not on every poll.
+    /// Returns nil when the scan itself failed, so callers can tell
+    /// "couldn't look" apart from "nothing running".
+    static func scan(includePython: Bool, knownLaunchers: [ProcessKey: Launcher]) async -> [DevServer]? {
+        guard let listeners = listeningProcesses(includePython: includePython) else { return nil }
         guard !listeners.isEmpty else { return [] }
 
         let pids = listeners.keys.sorted()
-        nonisolated(unsafe) var cwds: [Int32: String] = [:]
-        nonisolated(unsafe) var table: [Int32: ProcInfo] = [:]
-        nonisolated(unsafe) var args: [Int32: String] = [:]
-        nonisolated(unsafe) var services: [Int32: String] = [:]
-        // Each index writes only its own variable, so there is no shared mutation.
-        DispatchQueue.concurrentPerform(iterations: 4) { i in
-            switch i {
-            case 0: cwds = workingDirectories(pids: pids)
-            case 1: table = processTable()
-            case 2: args = commandLines(pids: pids)
-            default: services = launchdLabels()
-            }
-        }
+        async let cwds = workingDirectories(pids: pids)
+        async let table = processTable()
+        async let args = commandLines(pids: pids)
+        async let services = launchdLabels()
+        return await assemble(listeners: listeners, pids: pids, knownLaunchers: knownLaunchers,
+                              cwds: cwds, table: table, args: args, services: services)
+    }
+
+    private static func assemble(
+        listeners: [Int32: Listener], pids: [Int32], knownLaunchers: [ProcessKey: Launcher],
+        cwds: [Int32: String], table: [Int32: ProcInfo], args: [Int32: String], services: [Int32: String]
+    ) -> [DevServer] {
+        var keys: [Int32: ProcessKey] = [:]
+        for pid in pids { keys[pid] = ProcessKey.current(pid) }   // nil: exited mid-scan, dropped below
 
         var launchers: [Int32: Launcher] = [:]
-        for pid in pids { launchers[pid] = launcher(for: pid, table: table, services: services) }
+        var needsEnvironment: [Int32] = []
+        for pid in pids {
+            guard let key = keys[pid] else { continue }
+            if let known = knownLaunchers[key] { launchers[pid] = known; continue }
+            let found = launcher(for: pid, table: table, services: services)
+            launchers[pid] = found
+            if found == .orphaned || found == .unknown { needsEnvironment.append(pid) }
+        }
         // A server whose launcher exited lost its parent chain, but not the
         // environment it was started with. Check that for agent markers.
-        let detached = pids.filter { launchers[$0] == .orphaned || launchers[$0] == .unknown }
-        for (pid, name) in launchersFromEnvironment(pids: detached) {
+        for (pid, name) in launchersFromEnvironment(pids: needsEnvironment, args: args) {
             launchers[pid] = .agent("\(name) (detached)")
         }
 
         return pids.compactMap { pid -> DevServer? in
-            guard let l = listeners[pid] else { return nil }
+            guard let l = listeners[pid], let key = keys[pid] else { return nil }
             let cwd = cwds[pid]
             return DevServer(
-                pid: pid,
+                key: key,
                 runtime: l.runtime,
                 ports: l.ports.sorted(),
                 exposed: l.exposed,
+                openHost: l.openHost,
                 folder: (cwd == nil || cwd == "/") ? nil : cwd,
                 commandLine: summarize(args[pid] ?? l.runtime),
                 uptime: formatElapsed(table[pid]?.elapsed ?? ""),
@@ -97,21 +131,41 @@ enum Scanner {
     private struct Listener {
         var runtime: String
         var ports: Set<Int> = []
-        var exposed = false
+        var hosts: Set<String> = []
+
+        static func isLoopback(_ host: String) -> Bool {
+            host.hasPrefix("127.") || host == "[::1]" || host == "localhost"
+        }
+
+        /// lsof prints both the IPv4 and IPv6 wildcard as "*". Anything that is
+        /// not loopback (wildcard, a LAN address, a Tailscale address) can be
+        /// reached from another machine.
+        var exposed: Bool { hosts.contains { !Listener.isLoopback($0) } }
+
+        /// A server bound only to one specific address doesn't answer on
+        /// localhost, so Open has to use that address.
+        var openHost: String {
+            let specific = hosts.filter { $0 != "*" && !Listener.isLoopback($0) }
+            if hosts.contains(where: { $0 == "*" || Listener.isLoopback($0) }) || specific.count != 1 {
+                return "localhost"
+            }
+            return specific.first ?? "localhost"
+        }
     }
 
     private static func runtime(for command: String, includePython: Bool) -> String? {
-        let c = command.lowercased()
-        if c == "node" || c.hasPrefix("node") { return "node" }
-        if c == "bun" { return "bun" }
-        if c == "deno" { return "deno" }
-        if includePython, c.hasPrefix("python") { return "python" }
-        return nil
+        switch command.lowercased() {
+        case "node", "nodejs": return "node"
+        case "bun": return "bun"
+        case "deno": return "deno"
+        case let c where includePython && c.hasPrefix("python"): return "python"
+        default: return nil
+        }
     }
 
     /// `+c 0` asks lsof for full command names instead of 9-character truncations.
-    private static func listeningProcesses(includePython: Bool) -> [Int32: Listener] {
-        let out = run("/usr/sbin/lsof", ["-nP", "+c", "0", "-iTCP", "-sTCP:LISTEN", "-F", "pcn"])
+    private static func listeningProcesses(includePython: Bool) -> [Int32: Listener]? {
+        guard let out = run("/usr/sbin/lsof", ["-nP", "+c", "0", "-iTCP", "-sTCP:LISTEN", "-F", "pcn"]) else { return nil }
         var result: [Int32: Listener] = [:]
         var pid: Int32 = 0
         var runtimeName: String?
@@ -129,10 +183,9 @@ enum Scanner {
                 guard let runtimeName, pid > 0,
                       let colon = value.lastIndex(of: ":"),
                       let port = Int(value[value.index(after: colon)...]) else { continue }
-                let host = value[..<colon]
                 var l = result[pid] ?? Listener(runtime: runtimeName)
                 l.ports.insert(port)
-                if host == "*" || host == "0.0.0.0" || host == "[::]" { l.exposed = true }
+                l.hosts.insert(String(value[..<colon]))
                 result[pid] = l
             default:
                 continue
@@ -141,9 +194,9 @@ enum Scanner {
         return result
     }
 
-    private static func workingDirectories(pids: [Int32]) -> [Int32: String] {
+    private static func workingDirectories(pids: [Int32]) async -> [Int32: String] {
         let list = pids.map(String.init).joined(separator: ",")
-        let out = run("/usr/sbin/lsof", ["-a", "-p", list, "-d", "cwd", "-F", "pn"])
+        let out = run("/usr/sbin/lsof", ["-a", "-p", list, "-d", "cwd", "-F", "pn"]) ?? ""
         var result: [Int32: String] = [:]
         var pid: Int32 = 0
         for line in out.split(separator: "\n") {
@@ -161,8 +214,8 @@ enum Scanner {
         let executable: String   // full path; may contain spaces
     }
 
-    private static func processTable() -> [Int32: ProcInfo] {
-        let out = run("/bin/ps", ["-axo", "pid=,ppid=,etime=,comm="])
+    private static func processTable() async -> [Int32: ProcInfo] {
+        let out = run("/bin/ps", ["-axo", "pid=,ppid=,etime=,comm="]) ?? ""
         var table: [Int32: ProcInfo] = [:]
         for line in out.split(separator: "\n") {
             let parts = line.split(separator: " ", maxSplits: 3, omittingEmptySubsequences: true)
@@ -172,9 +225,9 @@ enum Scanner {
         return table
     }
 
-    private static func commandLines(pids: [Int32]) -> [Int32: String] {
+    private static func commandLines(pids: [Int32]) async -> [Int32: String] {
         let list = pids.map(String.init).joined(separator: ",")
-        let out = run("/bin/ps", ["-o", "pid=,args=", "-p", list])
+        let out = run("/bin/ps", ["-o", "pid=,args=", "-p", list]) ?? ""
         var result: [Int32: String] = [:]
         for line in out.split(separator: "\n") {
             let parts = line.split(separator: " ", maxSplits: 1, omittingEmptySubsequences: true)
@@ -185,8 +238,8 @@ enum Scanner {
     }
 
     /// Maps running launchd jobs (LaunchAgents) to their labels, skipping Apple's own.
-    private static func launchdLabels() -> [Int32: String] {
-        let out = run("/bin/launchctl", ["list"])
+    private static func launchdLabels() async -> [Int32: String] {
+        let out = run("/bin/launchctl", ["list"]) ?? ""
         var result: [Int32: String] = [:]
         for line in out.split(separator: "\n").dropFirst() {
             let parts = line.split(separator: "\t")
@@ -244,9 +297,7 @@ enum Scanner {
         return .unknown
     }
 
-    /// Environment markers that identify who started a process. Only these exact
-    /// names are checked: agent environments also carry tokens, so nothing else is
-    /// read out of the `ps eww` output, kept, or shown.
+    /// Environment markers that identify who started a process.
     private static let environmentMarkers: [(token: String, name: String)] = [
         ("CLAUDECODE=1", "Claude Code"),
         ("__CFBundleIdentifier=com.anthropic.claudefordesktop", "Claude"),
@@ -260,15 +311,24 @@ enum Scanner {
         ("TERM_PROGRAM=WarpTerminal", "Warp"),
     ]
 
-    private static func launchersFromEnvironment(pids: [Int32]) -> [Int32: String] {
+    /// `ps eww` prints the arguments followed by the whole environment, which in
+    /// agent sessions includes tokens. Only the marker names above are matched;
+    /// the text is dropped when this returns and is never logged or shown. The
+    /// caller caches the result per process, so each server is read once.
+    ///
+    /// The arguments are cut off first so a process can't fake a launcher by
+    /// passing "CLAUDECODE=1" as an argument.
+    private static func launchersFromEnvironment(pids: [Int32], args: [Int32: String]) -> [Int32: String] {
         guard !pids.isEmpty else { return [:] }
         let list = pids.map(String.init).joined(separator: ",")
-        let out = run("/bin/ps", ["eww", "-o", "pid=,command=", "-p", list])
+        guard let out = run("/bin/ps", ["eww", "-o", "pid=,command=", "-p", list]) else { return [:] }
         var result: [Int32: String] = [:]
         for line in out.split(separator: "\n") {
             let parts = line.split(separator: " ", maxSplits: 1, omittingEmptySubsequences: true)
             guard parts.count == 2, let pid = Int32(parts[0]) else { continue }
-            let tokens = Set(parts[1].split(separator: " ").map(String.init))
+            var full = parts[1]
+            if let a = args[pid], full.hasPrefix(a) { full = full.dropFirst(a.count) }
+            let tokens = Set(full.split(separator: " ").map(String.init))
             // Earlier entries win: an agent beats the terminal it ran in.
             if let hit = environmentMarkers.first(where: { marker in
                 marker.token.hasSuffix("=")
@@ -286,7 +346,7 @@ enum Scanner {
     /// "/opt/homebrew/bin/node /Users/joe/x/node_modules/.bin/vite --port 5173" -> "vite --port 5173"
     private static func summarize(_ args: String) -> String {
         var parts = args.split(separator: " ").map(String.init)
-        if let first = parts.first, ["node", "bun", "deno"].contains((first as NSString).lastPathComponent) || first.lowercased().contains("python") {
+        if let first = parts.first, ["node", "nodejs", "bun", "deno"].contains((first as NSString).lastPathComponent) || first.lowercased().contains("python") {
             parts.removeFirst()
         }
         parts = parts.map { $0.hasPrefix("/") ? ($0 as NSString).lastPathComponent : $0 }
@@ -310,16 +370,28 @@ enum Scanner {
         return m > 0 ? "\(m)m" : "just now"
     }
 
-    private static func run(_ path: String, _ args: [String]) -> String {
+    /// Runs a command and returns its output, or nil if it couldn't start or
+    /// had to be killed. The deadline matters: lsof can hang on an unresponsive
+    /// network mount, and a hung scan would otherwise freeze the list for good.
+    private static func run(_ path: String, _ args: [String], timeout: TimeInterval = 5) -> String? {
         let task = Process()
         task.executableURL = URL(fileURLWithPath: path)
         task.arguments = args
+        // Apps launched by launchd have no locale. Set one so non-ASCII paths
+        // come back as UTF-8 rather than escaped.
+        task.environment = ["LANG": "en_US.UTF-8"]
         let pipe = Pipe()
         task.standardOutput = pipe
         task.standardError = FileHandle.nullDevice
-        do { try task.run() } catch { return "" }
+        do { try task.run() } catch { return nil }
+
+        let deadline = DispatchWorkItem { if task.isRunning { task.terminate() } }
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeout, execute: deadline)
+        // Read to EOF before waiting, so a full pipe buffer can't deadlock the child.
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         task.waitUntilExit()
+        deadline.cancel()
+        if task.terminationReason == .uncaughtSignal { return nil }
         return String(decoding: data, as: UTF8.self)
     }
 }

@@ -9,11 +9,11 @@ Built because AI agents often start a server and never mention it.
 For every node, bun or deno process listening on a TCP port (Python optional):
 
 - **Port and project folder**: the folder is the process's working directory.
-- **Who started it**: found by walking the parent processes (Claude Code, Codex, Cursor, a terminal, or a launchd service). If the launcher has exited, the server's environment is checked for agent markers such as `CLAUDECODE=1`. Only those marker names are read: agent environments also hold tokens, and nothing else from them is kept or shown.
-- **Network exposure**: an orange warning when a server listens on all interfaces (`*` / `0.0.0.0`) instead of `127.0.0.1`, which makes it reachable from other devices on your Wi-Fi.
+- **Who started it**: found by walking the parent processes (Claude Code, Codex, Cursor, a terminal, or a launchd service). If the launcher has exited, the server's environment is checked for agent markers such as `CLAUDECODE=1`. `ps` returns the whole environment, which in agent sessions includes tokens; NodeWatch matches only the marker names, never logs or shows the rest, and reads each server's environment once, not on every poll. Markers in a process's arguments are ignored, so a process can't fake its launcher that way.
+- **Network exposure**: an orange warning when a server is bound to anything other than loopback (`127.0.0.1` / `::1`): all interfaces, a LAN address, or a VPN address. Those are reachable from other machines. Open uses the bound address when a server doesn't answer on localhost.
 - **Uptime**, the command that was run, and the PID.
 
-Actions: **Open** (localhost in your browser), **Show Folder**, **Stop** (click twice to confirm; sends SIGTERM, then offers **Force Stop** if the server is still running 2 seconds later).
+Actions: **Open** (in your browser), **Show Folder**, **Stop** (click twice to confirm; sends SIGTERM, then offers **Force Stop** if the server is still running 2 seconds later). Before any signal, NodeWatch checks the process's start time still matches, so a PID that macOS has reused for a different process is never signalled.
 
 The menu bar shows a server icon with a count of running servers. Network exposure is flagged on each row inside the menu, not in the menu bar.
 
