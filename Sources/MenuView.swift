@@ -2,6 +2,9 @@ import SwiftUI
 
 struct MenuView: View {
     @Bindable var store: ServerStore
+    /// A ScrollView has no height of its own, and a menu bar window sizes to fit
+    /// its content, so the list collapses to zero unless it's given a measured height.
+    @State private var listHeight: CGFloat = 0
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -20,8 +23,9 @@ struct MenuView: View {
                             if server.id != store.servers.last?.id { Divider().padding(.leading, 12) }
                         }
                     }
+                    .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { listHeight = $0 }
                 }
-                .frame(maxHeight: 420)
+                .frame(height: min(listHeight, 420))
             }
             Divider()
             footer
