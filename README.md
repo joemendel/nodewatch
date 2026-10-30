@@ -15,9 +15,22 @@ AI coding agents start dev servers all the time, often in the background, and ra
 - **Who started it.** Claude Code, Codex, Cursor, VS Code, a terminal (Terminal, iTerm2, Ghostty, Warp and others), or a background service. It still works after the agent or shell that started the server has exited (see [How it works](#how-it-works)).
 - **Network exposure warning.** An orange icon marks any server bound to something other than `127.0.0.1` / `::1`, for example after `vite --host` or a bare `app.listen(port)`. Those servers can be reached from other devices on your Wi-Fi.
 - **Actions:** Open in your browser, Show Folder in Finder, and Stop (click twice to confirm). Stop asks the server to shut down cleanly first and offers Force Stop if it ignores that.
+- **Local (WordPress) sites, optional.** If you use [Local](https://localwp.com), NodeWatch can list its running sites, one row each with domain and PHP version, plus Local's shared router and Mailpit. See [Local sites](#local-sites).
 - **Optional:** notifications when a new server starts, Python servers in the list, launch at login.
 
 Runtimes covered: `node`, `bun` and `deno`, plus Python if you turn it on.
+
+## Local sites
+
+Turn on **Include Local (WordPress) sites** to add a Local section to the menu. Local runs every site as several processes (nginx, PHP-FPM and MySQL) plus a shared router and Mailpit, so NodeWatch groups them into one row per site instead.
+
+- **Each site:** name, `.local` domain, PHP version and uptime, with **Open**, **Show Folder** and **Stop in Local**.
+- **Shared services:** the router's ports and a **Mailpit** button, which opens the inbox that catches email your sites send.
+- **Exposure:** Local's router listens on ports 80 and 443, and Mailpit on its web port, on every network interface by default. Both get the orange warning. Mailpit matters most: anyone on your network can read the emails your dev sites sent, password resets included.
+
+There is no Stop button for Local sites on purpose. Local starts and stops its own sites. Stopping their processes from outside would leave Local showing them as running, and a forced stop risks corrupting a site's MySQL database. **Stop in Local** brings Local to the front instead.
+
+NodeWatch reads Local's internal files (`~/Library/Application Support/Local/sites.json` and its `run/` folder). They aren't a public interface, so a Local update could change them. If that happens, the Local section disappears rather than showing wrong information. Tested with Local's nginx 1.26.1, MySQL 8.0.35, PHP 8.4.10 and Mailpit 1.24.1 services.
 
 ## Requirements
 
@@ -84,6 +97,7 @@ Every 5 seconds NodeWatch runs a few standard macOS commands, all read-only:
 - No analytics, telemetry or logging.
 - To identify launchers it reads other processes' environments, which in agent sessions can include API tokens. It only matches the marker names listed in `Sources/Scanner.swift`, never stores or displays anything else, and discards the text immediately.
 - It can only see and stop processes that belong to your user account.
+- With the Local option on, it reads Local's `sites.json`, which also stores each site's database credentials. NodeWatch copies out only the site name, domain, folder, PHP version and Mailpit port. The rest of the file is parsed along the way but never kept, logged or shown.
 
 ## Limitations
 
@@ -111,6 +125,7 @@ Every 5 seconds NodeWatch runs a few standard macOS commands, all read-only:
 | File | What it does |
 |---|---|
 | `Sources/Scanner.swift` | Finds servers and launchers using `lsof`, `ps` and `launchctl`. No UI code. |
+| `Sources/LocalSites.swift` | Finds running Local sites and their shared router and Mailpit. |
 | `Sources/ServerStore.swift` | App state, the 5-second polling, actions, notifications, launch at login. |
 | `Sources/MenuView.swift` | The menu bar window. |
 | `Sources/NodeWatchApp.swift` | App entry point. |

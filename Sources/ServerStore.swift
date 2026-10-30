@@ -8,7 +8,11 @@ import UserNotifications
 @Observable
 final class ServerStore {
     private(set) var servers: [DevServer] = []
+    private(set) var local: LocalStatus?
     private(set) var lastScan: Date?
+
+    /// What the menu bar count shows: dev servers plus running Local sites.
+    var totalCount: Int { servers.count + (local?.sites.count ?? 0) }
     /// Processes that were asked to stop but are still running: offer a force stop.
     private(set) var stubborn: Set<ProcessKey> = []
 
@@ -17,6 +21,12 @@ final class ServerStore {
             UserDefaults.standard.set(includePython, forKey: "includePython")
             // Servers that appear only because of this toggle aren't "new".
             suppressNextNotifications = true
+            refresh()
+        }
+    }
+    var includeLocal: Bool {
+        didSet {
+            UserDefaults.standard.set(includeLocal, forKey: "includeLocal")
             refresh()
         }
     }
@@ -38,8 +48,9 @@ final class ServerStore {
 
     init() {
         let defaults = UserDefaults.standard
-        defaults.register(defaults: ["includePython": false, "notifyOnNew": true])
+        defaults.register(defaults: ["includePython": false, "includeLocal": false, "notifyOnNew": true])
         includePython = defaults.bool(forKey: "includePython")
+        includeLocal = defaults.bool(forKey: "includeLocal")
         notifyOnNew = defaults.bool(forKey: "notifyOnNew")
         if notifyOnNew { requestNotificationPermission() }
         refresh()
@@ -58,22 +69,25 @@ final class ServerStore {
         guard !scanning else { rescanPending = true; return }
         scanning = true
         let python = includePython
+        let withLocal = includeLocal
         var knownLaunchers: [ProcessKey: Launcher] = [:]
         for server in servers { knownLaunchers[server.key] = server.launcher }
         Task.detached(priority: .utility) {
-            let found = await Scanner.scan(includePython: python, knownLaunchers: knownLaunchers)
-            await MainActor.run { self.apply(found) }
+            let result = await Scanner.scan(includePython: python, includeLocal: withLocal, knownLaunchers: knownLaunchers)
+            await MainActor.run { self.apply(result) }
         }
     }
 
-    private func apply(_ found: [DevServer]?) {
+    private func apply(_ result: ScanResult?) {
         scanning = false
         defer {
             if rescanPending { rescanPending = false; refresh() }
         }
         // nil means the scan itself failed. Keep the last good list rather than
         // reporting "nothing running" and re-notifying everything next time.
-        guard let found else { return }
+        guard let result else { return }
+        let found = result.servers
+        local = result.local
 
         let endpoints = Set(found.map(endpoint))
         if !suppressNextNotifications, notifyOnNew {
@@ -99,7 +113,24 @@ final class ServerStore {
 
     func reveal(_ server: DevServer) {
         guard let folder = server.folder else { return }
+        reveal(folder: folder)
+    }
+
+    func reveal(folder: String) {
         NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: folder)])
+    }
+
+    func open(urlString: String) {
+        guard let url = URL(string: urlString) else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    /// Local sites are started and stopped in Local itself. Stopping their
+    /// processes from here would leave Local showing them as running, and a
+    /// forced stop risks corrupting the site's MySQL database.
+    func openLocalApp() {
+        guard let app = NSWorkspace.shared.urlForApplication(withBundleIdentifier: Scanner.localBundleID) else { return }
+        NSWorkspace.shared.openApplication(at: app, configuration: NSWorkspace.OpenConfiguration())
     }
 
     /// SIGTERM lets the server shut down cleanly. If it is still alive 2 s later,

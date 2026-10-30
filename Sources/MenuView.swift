@@ -10,7 +10,7 @@ struct MenuView: View {
         VStack(alignment: .leading, spacing: 0) {
             header
             Divider()
-            if store.servers.isEmpty {
+            if store.servers.isEmpty && store.local == nil {
                 Text("No dev servers running")
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity)
@@ -21,6 +21,10 @@ struct MenuView: View {
                         ForEach(store.servers) { server in
                             ServerRow(server: server, store: store)
                             if server.id != store.servers.last?.id { Divider().padding(.leading, 12) }
+                        }
+                        if let local = store.local {
+                            if !store.servers.isEmpty { Divider() }
+                            LocalSection(local: local, store: store)
                         }
                     }
                     .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { listHeight = $0 }
@@ -36,7 +40,7 @@ struct MenuView: View {
 
     private var header: some View {
         HStack {
-            Text(store.servers.count == 1 ? "1 dev server" : "\(store.servers.count) dev servers")
+            Text(store.totalCount == 1 ? "1 dev server" : "\(store.totalCount) dev servers")
                 .font(.headline)
             Spacer()
             Button { store.refresh() } label: { Image(systemName: "arrow.clockwise") }
@@ -49,6 +53,7 @@ struct MenuView: View {
     private var footer: some View {
         VStack(alignment: .leading, spacing: 6) {
             Toggle("Include Python servers", isOn: $store.includePython)
+            Toggle("Include Local (WordPress) sites", isOn: $store.includeLocal)
             Toggle("Notify when a new server starts", isOn: $store.notifyOnNew)
             if store.notifyOnNew { notificationStatus }
             Toggle("Launch at login", isOn: Binding(
@@ -136,11 +141,7 @@ struct ServerRow: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
                 Spacer()
-                if server.exposed {
-                    Image(systemName: "wifi.exclamationmark")
-                        .foregroundStyle(.orange)
-                        .help("Listening on all interfaces: reachable from your network")
-                }
+                if server.exposed { ExposedIcon() }
                 Text(server.uptime)
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -216,5 +217,88 @@ struct ServerRow: View {
         case .orphaned: "questionmark.circle"
         case .unknown: "circle.dotted"
         }
+    }
+}
+
+/// Sites running in Local (the WordPress app), plus its shared router and Mailpit.
+/// There is no Stop here on purpose: Local starts and stops its own sites.
+struct LocalSection: View {
+    let local: LocalStatus
+    let store: ServerStore
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 6) {
+                Text("Local").font(.subheadline.weight(.semibold))
+                if !local.routerPorts.isEmpty {
+                    Text("router " + local.routerPorts.map { ":\($0)" }.joined(separator: " "))
+                        .font(.caption).foregroundStyle(.secondary)
+                    if local.routerExposed { ExposedIcon(what: "Local's router") }
+                }
+                Spacer()
+                if let mail = local.mailpitURL {
+                    Button("Mailpit") { store.open(urlString: mail) }
+                        .help("Open Mailpit, which catches email your Local sites send")
+                    if local.mailpitExposed { ExposedIcon(what: "Mailpit (it shows every email your sites sent)") }
+                }
+                Button("Open Local") { store.openLocalApp() }
+            }
+            .controlSize(.small)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+
+            if local.sites.isEmpty {
+                Text("No sites running")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .padding(.horizontal, 12).padding(.bottom, 8)
+            }
+            ForEach(local.sites) { site in
+                Divider().padding(.leading, 12)
+                LocalSiteRow(site: site, store: store)
+            }
+        }
+    }
+}
+
+struct LocalSiteRow: View {
+    let site: LocalSite
+    let store: ServerStore
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(alignment: .firstTextBaseline) {
+                Image(systemName: "w.circle")
+                    .foregroundStyle(.secondary)
+                Text(site.name).fontWeight(.semibold).lineLimit(1)
+                Spacer()
+                Text(site.uptime).font(.caption).foregroundStyle(.secondary)
+            }
+            Text(site.domain + (site.php.map { " · PHP \($0)" } ?? ""))
+                .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+            HStack(spacing: 8) {
+                Button("Open") { store.open(urlString: site.url) }
+                if let folder = site.folder {
+                    Button("Show Folder") { store.reveal(folder: folder) }
+                }
+                Spacer()
+                Button("Stop in Local") { store.openLocalApp() }
+                    .help("Local starts and stops its own sites. Stopping them from here would confuse Local and could damage the site's database.")
+            }
+            .controlSize(.small)
+            .padding(.top, 2)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+    }
+}
+
+/// The orange "reachable from your network" marker, shared by every row type.
+struct ExposedIcon: View {
+    var what: String = "This server"
+
+    var body: some View {
+        Image(systemName: "wifi.exclamationmark")
+            .foregroundStyle(.orange)
+            .help("\(what) is reachable from other devices on your network")
     }
 }

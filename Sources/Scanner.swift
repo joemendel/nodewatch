@@ -65,6 +65,11 @@ enum Launcher: Sendable, Equatable {
     }
 }
 
+struct ScanResult: Sendable {
+    var servers: [DevServer]
+    var local: LocalStatus?      // nil when Local isn't included or isn't running
+}
+
 enum Scanner {
     /// One lsof pass to find listeners, then four lookups run in parallel
     /// (about 250 ms in all, mostly process startup).
@@ -73,17 +78,27 @@ enum Scanner {
     /// detached server's environment is read once, not on every poll.
     /// Returns nil when the scan itself failed, so callers can tell
     /// "couldn't look" apart from "nothing running".
-    static func scan(includePython: Bool, knownLaunchers: [ProcessKey: Launcher]) async -> [DevServer]? {
-        guard let listeners = listeningProcesses(includePython: includePython) else { return nil }
-        guard !listeners.isEmpty else { return [] }
+    static func scan(includePython: Bool, includeLocal: Bool, knownLaunchers: [ProcessKey: Launcher]) async -> ScanResult? {
+        guard let all = allListeners() else { return nil }
+        let local = includeLocal ? scanLocal(listeners: all) : nil
+
+        var listeners: [Int32: Listener] = [:]
+        for (pid, l) in all {
+            guard let runtime = runtime(for: l.command, includePython: includePython) else { continue }
+            var dev = l
+            dev.runtime = runtime
+            listeners[pid] = dev
+        }
+        guard !listeners.isEmpty else { return ScanResult(servers: [], local: local) }
 
         let pids = listeners.keys.sorted()
         async let cwds = workingDirectories(pids: pids)
         async let table = processTable()
         async let args = commandLines(pids: pids)
         async let services = launchdLabels()
-        return await assemble(listeners: listeners, pids: pids, knownLaunchers: knownLaunchers,
-                              cwds: cwds, table: table, args: args, services: services)
+        let servers = await assemble(listeners: listeners, pids: pids, knownLaunchers: knownLaunchers,
+                                     cwds: cwds, table: table, args: args, services: services)
+        return ScanResult(servers: servers, local: local)
     }
 
     private static func assemble(
@@ -128,8 +143,9 @@ enum Scanner {
 
     // MARK: - lsof
 
-    private struct Listener {
-        var runtime: String
+    struct Listener: Sendable {
+        var command: String
+        var runtime: String = ""
         var ports: Set<Int> = []
         var hosts: Set<String> = []
 
@@ -163,12 +179,14 @@ enum Scanner {
         }
     }
 
+    /// Every TCP listener you own, with its command name. Dev servers and Local
+    /// are both picked out of this one pass.
     /// `+c 0` asks lsof for full command names instead of 9-character truncations.
-    private static func listeningProcesses(includePython: Bool) -> [Int32: Listener]? {
+    private static func allListeners() -> [Int32: Listener]? {
         guard let out = run("/usr/sbin/lsof", ["-nP", "+c", "0", "-iTCP", "-sTCP:LISTEN", "-F", "pcn"]) else { return nil }
         var result: [Int32: Listener] = [:]
         var pid: Int32 = 0
-        var runtimeName: String?
+        var command = ""
 
         for line in out.split(separator: "\n") {
             guard let tag = line.first else { continue }
@@ -176,14 +194,14 @@ enum Scanner {
             switch tag {
             case "p":
                 pid = Int32(value) ?? 0
-                runtimeName = nil
+                command = ""
             case "c":
-                runtimeName = runtime(for: value, includePython: includePython)
+                command = value
             case "n":
-                guard let runtimeName, pid > 0,
+                guard pid > 0,
                       let colon = value.lastIndex(of: ":"),
                       let port = Int(value[value.index(after: colon)...]) else { continue }
-                var l = result[pid] ?? Listener(runtime: runtimeName)
+                var l = result[pid] ?? Listener(command: command)
                 l.ports.insert(port)
                 l.hosts.insert(String(value[..<colon]))
                 result[pid] = l
@@ -373,7 +391,7 @@ enum Scanner {
     /// Runs a command and returns its output, or nil if it couldn't start or
     /// had to be killed. The deadline matters: lsof can hang on an unresponsive
     /// network mount, and a hung scan would otherwise freeze the list for good.
-    private static func run(_ path: String, _ args: [String], timeout: TimeInterval = 5) -> String? {
+    static func run(_ path: String, _ args: [String], timeout: TimeInterval = 5) -> String? {
         let task = Process()
         task.executableURL = URL(fileURLWithPath: path)
         task.arguments = args

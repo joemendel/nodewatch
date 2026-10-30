@@ -12,8 +12,8 @@ struct NodeWatchApp: App {
             // is the cue that something is running. The network-exposure warning
             // lives on each row in the menu, so the menu bar stays calm.
             Image(systemName: "server.rack")
-            if !store.servers.isEmpty {
-                Text("\(store.servers.count)")
+            if store.totalCount > 0 {
+                Text("\(store.totalCount)")
             }
         }
         .menuBarExtraStyle(.window)
