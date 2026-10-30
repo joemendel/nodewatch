@@ -60,7 +60,7 @@ cd nodewatch
 
 `build.sh` compiles the app, signs it for local use, copies it to `~/Applications/NodeWatch.app`, and launches it. Look for the server icon in your menu bar.
 
-To update later, pull and run `./build.sh` again. It quits the running copy, replaces it, and relaunches.
+To update later, pull and run `./build.sh` again. It quits the running copy, replaces it, and relaunches. [CHANGELOG.md](CHANGELOG.md) lists what changed in each version.
 
 To build without installing, run `./build.sh --no-install`. The app ends up in `build/NodeWatch.app`.
 

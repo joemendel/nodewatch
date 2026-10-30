@@ -6,7 +6,7 @@ set -euo pipefail
 cd "${0:A:h}"
 
 APP=build/NodeWatch.app
-VERSION=1.0.0
+VERSION=1.1.0
 
 rm -rf build
 mkdir -p "$APP/Contents/MacOS"
